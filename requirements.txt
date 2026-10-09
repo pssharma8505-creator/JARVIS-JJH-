@@ -31,7 +31,11 @@ playwright>=1.40,<2
 # serves without notice and yt-dlp answers with a release; an upper bound would
 # eventually pin a fresh clone to a version YouTube has already broken, which is
 # the opposite of what bounds are for. Keep it current: pip install -U yt-dlp
-yt-dlp
+#
+# The [default] extra matters: current yt-dlp needs a JavaScript solver for most
+# YouTube videos, and that extra bundles it (yt-dlp-ejs). It ALSO needs a
+# JavaScript runtime on the machine — Node.js or deno — which pip cannot install.
+yt-dlp[default]
 
 # ── Automation / input control ────────────────────────────────────────────────
 pyautogui

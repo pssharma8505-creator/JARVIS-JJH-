@@ -41,11 +41,11 @@ from PyQt6.QtGui import (
 # absent on a stripped-down system, so a failure here disables one feature
 # rather than stopping JARVIS from starting.
 try:
-    from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
+    from PyQt6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
     from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
     HAVE_VIDEO = True
 except Exception as _e:            # noqa: BLE001 - reported, never fatal
-    QAudioOutput = QMediaPlayer = QGraphicsVideoItem = None
+    QAudioOutput = QMediaDevices = QMediaPlayer = QGraphicsVideoItem = None
     HAVE_VIDEO = False
     print(f"[Video] playback unavailable ({_e}) — the HUD will not show video.")
 
@@ -2053,11 +2053,11 @@ class AudioDeviceOverlay(_HudOverlay):
     webcam'."""
 
     picked = pyqtSignal()      # emitted after Apply, when something changed
+    rescan_requested = pyqtSignal()   # RESCAN pressed — re-enumerate OS devices
     _OW = 460
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        from core.audio_devices import list_devices, DEFAULT_LABEL
         from memory.config_manager import get_input_device, get_output_device
 
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -2101,19 +2101,7 @@ class AudioDeviceOverlay(_HudOverlay):
             box.setFont(QFont("Courier New", 9))
             box.setFixedHeight(30)
             box.setStyleSheet(_combo_css)
-            # The list is served from a cache warmed on a background thread at
-            # startup, so opening this panel never blocks the Qt thread on the
-            # host audio API.
-            box.addItem(DEFAULT_LABEL, "")
-            for name in list_devices(kind):
-                box.addItem(name, name)
-            idx = box.findData(current) if current else 0
-            box.setCurrentIndex(idx if idx >= 0 else 0)
-            if current and idx < 0:
-                # Saved device is not plugged in right now. Show it rather than
-                # silently resetting the user's choice to default.
-                box.addItem(f"{current}  (not connected)", current)
-                box.setCurrentIndex(box.count() - 1)
+            self._fill(box, kind, current)
             lay.addWidget(box)
             return box
 
@@ -2123,7 +2111,10 @@ class AudioDeviceOverlay(_HudOverlay):
         self._out_box = _row("SPEAKERS — what JARVIS talks through",
                              "output", get_output_device())
 
-        note = QLabel("Applying reconnects the session. Your conversation is kept.")
+        note = QLabel("Applying reconnects the session. Your conversation is kept.\n"
+                      "Bluetooth earbuds: connect them first, then press RESCAN. "
+                      "Using their microphone switches them to hands-free mode, so "
+                      "JARVIS routes its voice through the same headset.")
         note.setWordWrap(True)
         note.setFont(QFont("Courier New", 7))
         note.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
@@ -2143,6 +2134,19 @@ class AudioDeviceOverlay(_HudOverlay):
         ok.clicked.connect(self._apply)
         row.addWidget(ok)
 
+        self._rescan_btn = QPushButton("↻  RESCAN")
+        self._rescan_btn.setFixedHeight(32)
+        self._rescan_btn.setFont(QFont("Courier New", 9))
+        self._rescan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._rescan_btn.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 3px; }}
+            QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+            QPushButton:disabled {{ color: {C.TEXT_DIM}; }}
+        """)
+        self._rescan_btn.clicked.connect(self._rescan)
+        row.addWidget(self._rescan_btn)
+
         cancel = QPushButton("CLOSE")
         cancel.setFixedHeight(32)
         cancel.setFont(QFont("Courier New", 9))
@@ -2155,6 +2159,67 @@ class AudioDeviceOverlay(_HudOverlay):
         cancel.clicked.connect(self.hide)
         row.addWidget(cancel)
         lay.addLayout(row)
+
+        # The device list is rebuilt in the background after a hot-plug or a
+        # rescan; watch for that and refill, so the panel never shows a list the
+        # app has already moved past.
+        from core.audio_devices import generation
+        self._seen_gen = generation()
+        self._scanning = False
+        self._scan_ticks = 0
+        self._poll = QTimer(self)
+        self._poll.setInterval(600)
+        self._poll.timeout.connect(self._poll_devices)
+        self._poll.start()
+
+    def _fill(self, box: QComboBox, kind: str, current: str) -> None:
+        """(Re)populate one combo box, keeping `current` selected."""
+        from core.audio_devices import list_devices, DEFAULT_LABEL
+        box.clear()
+        # The list is served from a cache warmed on a background thread at
+        # startup, so opening this panel never blocks the Qt thread on the
+        # host audio API.
+        box.addItem(DEFAULT_LABEL, "")
+        for name in list_devices(kind):
+            box.addItem(name, name)
+        idx = box.findData(current) if current else 0
+        box.setCurrentIndex(idx if idx >= 0 else 0)
+        if current and idx < 0:
+            # Saved device is not plugged in right now. Show it rather than
+            # silently resetting the user's choice to default.
+            box.addItem(f"{current}  (not connected)", current)
+            box.setCurrentIndex(box.count() - 1)
+
+    def _refill_all(self) -> None:
+        self._fill(self._in_box,  "input",  self._in_box.currentData()  or "")
+        self._fill(self._out_box, "output", self._out_box.currentData() or "")
+
+    def _rescan(self) -> None:
+        self._scanning = True
+        self._scan_ticks = 0
+        self._rescan_btn.setEnabled(False)
+        self._rescan_btn.setText("SCANNING…")
+        self.rescan_requested.emit()
+
+    def _finish_scan(self) -> None:
+        self._scanning = False
+        self._rescan_btn.setEnabled(True)
+        self._rescan_btn.setText("↻  RESCAN")
+
+    def _poll_devices(self) -> None:
+        if not self.isVisible():
+            return
+        from core.audio_devices import generation
+        g = generation()
+        if g != self._seen_gen:
+            self._seen_gen = g
+            self._refill_all()
+            if self._scanning:
+                self._finish_scan()
+        elif self._scanning:
+            self._scan_ticks += 1
+            if self._scan_ticks > 50:      # ~30 s: give up waiting, re-enable
+                self._finish_scan()
 
     def _apply(self):
         from memory.config_manager import (
@@ -2988,6 +3053,11 @@ class MainWindow(QMainWindow):
         self.on_interrupt      = None   # callable: () -> None — stop JARVIS mid-speech
         self.on_voice_change   = None   # callable: () -> None — rebuild session with new voice
         self.on_audio_device_change = None  # callable: () -> None — reopen audio streams
+        self.on_audio_hotplug  = None   # callable: () -> None — an audio endpoint appeared/vanished
+        self.on_audio_rescan   = None   # callable: () -> None — user asked to re-scan devices
+        self._video_fallback   = None   # set by show_video(): runs if streaming fails
+        self._video_retry      = None   # the fallback of the video on screen right now
+        self._video_token      = 0      # identifies the current video for its watchdog
         self._confirm_overlay  = None   # live ConfirmBanner, if one is on screen
         self.get_plugins       = None   # callable: () -> list[dict], set by JarvisLive
         self.get_plugin_settings = None # callable: () -> list[dict] settings schemas, set by JarvisLive
@@ -3160,6 +3230,27 @@ class MainWindow(QMainWindow):
             self._video_sync = QTimer(self)
             self._video_sync.setInterval(1000)
             self._video_sync.timeout.connect(self._sync_video_sound)
+
+            # Both outputs default to "whatever the OS default was when this
+            # window was built" and never move — so a Bluetooth headset connected
+            # later, or a speaker chosen in the device picker, was ignored by the
+            # video's sound. Follow the picker, and follow hot-plugging.
+            self._apply_video_output_device()
+            self._video_sound.errorOccurred.connect(self._on_video_error)
+
+            # Hot-plug: Qt hears about Bluetooth connecting and USB mics being
+            # pulled; PortAudio (which carries JARVIS's own voice and mic) does
+            # not. Debounced — a headset connecting fires a burst of events.
+            self._media_devices = QMediaDevices(self)
+            self._audio_snapshot = self._audio_endpoint_snapshot()
+            self._hotplug_timer = QTimer(self)
+            self._hotplug_timer.setSingleShot(True)
+            self._hotplug_timer.setInterval(2000)
+            self._hotplug_timer.timeout.connect(self._fire_audio_hotplug)
+            self._media_devices.audioInputsChanged.connect(
+                lambda: self._hotplug_timer.start())
+            self._media_devices.audioOutputsChanged.connect(
+                lambda: self._hotplug_timer.start())
         else:
             self._video_scene = None
             self._video_item = None
@@ -3356,13 +3447,24 @@ class MainWindow(QMainWindow):
         self._video_split = bool(audio_source)
         self._set_video_muted(bool(muted))
 
-        url = (QUrl.fromLocalFile(source) if Path(source).exists()
-               else QUrl(source))
-        self._video_player.setSource(url)
+        # Whatever the Python side registered to run if streaming fails.
+        self._video_retry, self._video_fallback = self._video_fallback, None
+        self._video_token += 1
+        token = self._video_token
+        self._apply_video_output_device()
+
+        self._video_player.setSource(self._as_url(source))
         if self._video_split:
-            self._video_sound.setSource(QUrl(audio_source))
+            # Was QUrl(audio_source) — which turns a LOCAL audio file into a
+            # relative URL Qt cannot open, so downloaded videos had no sound.
+            self._video_sound.setSource(self._as_url(audio_source))
         self._hud_cam_stack.setCurrentIndex(2)
         self._video_on = True
+        # The view has no size until the page is actually showing.
+        QTimer.singleShot(80, self._fit_video)
+        QTimer.singleShot(400, self._fit_video)
+        if self._video_retry:
+            QTimer.singleShot(15000, lambda: self._video_watchdog(token))
         # Re-run now that the video counts as playing: _set_video_muted ran
         # before this line and saw no video, so its mic check was a no-op.
         self._sync_mic_for_video()
@@ -3370,6 +3472,88 @@ class MainWindow(QMainWindow):
         if self._video_split:
             self._video_sound.play()
             self._video_sync.start()
+
+    @staticmethod
+    def _as_url(source: str):
+        """A local path becomes a file URL; anything else is taken as a URL."""
+        try:
+            if source and Path(source).exists():
+                return QUrl.fromLocalFile(source)
+        except (OSError, ValueError):
+            pass
+        return QUrl(source)
+
+    def _video_watchdog(self, token: int) -> None:
+        """Streaming that neither fails nor starts is the worst case: a black
+        panel and no error. If nothing has played after 15 s, fall back."""
+        if token != self._video_token or not self._video_on or not self._video_retry:
+            return
+        try:
+            if self._video_player.position() > 0:
+                return
+        except Exception:
+            pass
+        self._video_failover("no picture after 15 s")
+
+    def _video_failover(self, reason: str) -> bool:
+        """Streaming did not work: hand over to the registered fallback (which
+        downloads the video and plays the local file). True if one ran."""
+        fb, self._video_retry = self._video_retry, None
+        if not fb:
+            return False
+        self.write_log(f"SYS: Could not stream the video ({reason}) — "
+                       f"downloading it instead...")
+        self._on_video_close()
+        threading.Thread(target=fb, daemon=True, name="video-fallback").start()
+        return True
+
+    # ── Audio endpoints: follow the picker, notice hot-plugging ──────────
+    def _audio_endpoint_snapshot(self):
+        try:
+            return (
+                tuple(sorted(d.description() for d in QMediaDevices.audioInputs())),
+                tuple(sorted(d.description() for d in QMediaDevices.audioOutputs())),
+                QMediaDevices.defaultAudioInput().description(),
+                QMediaDevices.defaultAudioOutput().description(),
+            )
+        except Exception:
+            return None
+
+    def _fire_audio_hotplug(self) -> None:
+        snap = self._audio_endpoint_snapshot()
+        if snap is None or snap == self._audio_snapshot:
+            return
+        self._audio_snapshot = snap
+        self.write_log("SYS: Audio devices changed — refreshing.")
+        self._apply_video_output_device()
+        if self.on_audio_hotplug:
+            self.on_audio_hotplug()
+
+    def _apply_video_output_device(self) -> None:
+        """Point the video's sound at the speaker chosen in the device picker
+        (or the current OS default), including a Bluetooth headset's
+        Hands-Free endpoint when its mic is the one in use."""
+        if not HAVE_VIDEO:
+            return
+        try:
+            from core import audio_devices
+            from memory.config_manager import get_input_device, get_output_device
+            want = audio_devices.reconcile_bluetooth(
+                get_input_device(), get_output_device()).strip().lower()
+            target = None
+            if want and want != audio_devices.DEFAULT_LABEL.lower():
+                for d in QMediaDevices.audioOutputs():
+                    n = d.description().lower()
+                    if n == want or n.startswith(want[:24]) or want.startswith(n[:24]):
+                        target = d
+                        break
+            if target is None:
+                target = QMediaDevices.defaultAudioOutput()
+            for out in (self._video_audio, self._video_sound_out):
+                if out is not None:
+                    out.setDevice(target)
+        except Exception as e:
+            print(f"[Video] could not select audio output: {e}")
 
     def _fit_video(self, *_a) -> None:
         """Size the picture to the panel, keeping its shape."""
@@ -3390,6 +3574,8 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_video_close(self) -> None:
+        self._video_token += 1          # any pending watchdog is now stale
+        self._video_retry = None
         if self._video_sync:
             self._video_sync.stop()
         for p in (self._video_player, self._video_sound):
@@ -3474,9 +3660,12 @@ class MainWindow(QMainWindow):
     def _on_video_error(self, *_a) -> None:
         err = ""
         try:
-            err = self._video_player.errorString()
+            err = (self._video_player.errorString()
+                   or (self._video_sound.errorString() if self._video_split else ""))
         except Exception:
             pass
+        if self._video_failover(err or "playback error"):
+            return
         self.write_log(f"SYS: The video could not be played{(' — ' + err) if err else ''}.")
         self._on_video_close()
 
@@ -5396,13 +5585,20 @@ class MainWindow(QMainWindow):
     def _open_audio_devices(self):
         ov = AudioDeviceOverlay(parent=self.centralWidget())
         ov.picked.connect(self._on_audio_devices_applied)
+        ov.rescan_requested.connect(self._on_audio_rescan_requested)
         self._centre_overlay(ov)
         self._audio_overlay = ov            # keep a reference so it isn't GC'd
 
     def _on_audio_devices_applied(self):
         self._log.append_log("SYS: Audio devices updated.")
+        self._apply_video_output_device()
         if self.on_audio_device_change:
             self.on_audio_device_change()
+
+    def _on_audio_rescan_requested(self):
+        self._log.append_log("SYS: Re-scanning audio devices...")
+        if self.on_audio_rescan:
+            self.on_audio_rescan()
 
     # ── Memory panel ─────────────────────────────────────────────────────────
 
@@ -5657,6 +5853,22 @@ class JarvisUI:
     def on_audio_device_change(self, cb):
         self._win.on_audio_device_change = cb
 
+    @property
+    def on_audio_hotplug(self):
+        return self._win.on_audio_hotplug
+
+    @on_audio_hotplug.setter
+    def on_audio_hotplug(self, cb):
+        self._win.on_audio_hotplug = cb
+
+    @property
+    def on_audio_rescan(self):
+        return self._win.on_audio_rescan
+
+    @on_audio_rescan.setter
+    def on_audio_rescan(self, cb):
+        self._win.on_audio_rescan = cb
+
     def show_confirm(self, title: str, detail: str) -> None:
         """Thread-safe: raise the irreversible-action gate. Called from action
         handlers running in executor threads, so it goes through a signal."""
@@ -5802,7 +6014,7 @@ class JarvisUI:
         self._win._camera_sig.emit(img_bytes)
 
     def show_video(self, source: str, title: str = "", muted: bool = True,
-                   audio_source: str = "") -> None:
+                   audio_source: str = "", fallback=None) -> None:
         """Thread-safe: play a video where the avatar normally is.
 
         `source` is a local path or a direct media URL. `audio_source` is for
@@ -5815,6 +6027,9 @@ class JarvisUI:
         assistant worse. The user turns sound on from the header button or by
         asking, and closes it the same two ways.
         """
+        # `fallback` (optional callable) runs on a worker thread if the stream
+        # cannot be played — set before the signal so the Qt thread sees it.
+        self._win._video_fallback = fallback
         self._win._video_open_sig.emit(str(source or ""), str(title or ""),
                                        bool(muted), str(audio_source or ""))
 

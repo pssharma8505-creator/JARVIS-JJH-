@@ -25,7 +25,10 @@ SOUND IS OFF UNTIL ASKED FOR
 from __future__ import annotations
 
 import re
+import shutil
+import tempfile
 import threading
+import time
 import webbrowser
 from pathlib import Path
 
@@ -49,6 +52,50 @@ def _begin_open() -> int:
 def _still_wanted(token: int) -> bool:
     with _open_lock:
         return token == _open_seq
+
+
+# Where downloaded fallbacks live. Cleared of anything over a day old each time
+# a new download starts, so it never grows without bound.
+_CACHE_DIR = Path(tempfile.gettempdir()) / "jarvis_video"
+_warned_js = False
+
+
+def _ydl_opts(**extra) -> dict:
+    """yt-dlp options shared by resolving and downloading.
+
+    Current yt-dlp cannot read most YouTube videos without an external
+    JavaScript runtime (it defaults to deno and only deno). So whichever of
+    deno / node / bun / quickjs is installed gets enabled explicitly, instead of
+    the whole feature failing with "no usable formats" on a machine that has
+    Node but not deno. Its solver scripts come from `pip install
+    "yt-dlp[default]"`; remote component downloads are deliberately NOT enabled,
+    because that would fetch and run code from GitHub at playback time."""
+    global _warned_js
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True,
+            "socket_timeout": 20}
+    runtimes = {}
+    for key, exe in (("deno", "deno"), ("node", "node"), ("bun", "bun"),
+                     ("quickjs", "qjs")):
+        path = shutil.which(exe)
+        if path:
+            runtimes[key] = {"path": path}
+    if runtimes:
+        opts["js_runtimes"] = runtimes
+    if not _warned_js:
+        _warned_js = True
+        if not runtimes:
+            print("[Video] No JavaScript runtime found (deno, node, bun or "
+                  "quickjs). Current yt-dlp needs one for most YouTube videos "
+                  "— install Node.js or deno if videos fail to resolve.")
+        try:
+            import importlib.util
+            if importlib.util.find_spec("yt_dlp_ejs") is None:
+                print("[Video] yt-dlp's JavaScript solver package is missing. "
+                      'Run: pip install -U "yt-dlp[default]"')
+        except Exception:
+            pass
+    opts.update(extra)
+    return opts
 
 
 def _is_url(text: str) -> bool:
@@ -93,8 +140,7 @@ def _resolve_youtube(url_or_query: str) -> tuple[str, str, str, str]:
     query = url_or_query if _YT.search(url_or_query) else f"ytsearch1:{url_or_query}"
     # No "format" here on purpose: ask for everything and choose below, so a
     # video that lacks whatever was requested cannot fail outright.
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True,
-            "noplaylist": True}
+    opts = _ydl_opts(skip_download=True)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(query, download=False)
@@ -162,6 +208,66 @@ def _resolve_youtube(url_or_query: str) -> tuple[str, str, str, str]:
     return video["url"], (audio or {}).get("url", ""), info.get("title") or "", ""
 
 
+def _prune_cache(max_age_s: float = 86400.0) -> None:
+    try:
+        for f in _CACHE_DIR.glob("*"):
+            if f.is_file() and time.time() - f.stat().st_mtime > max_age_s:
+                f.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _download(query: str, fmt: str, stem: str):
+    """Download one format with yt-dlp. -> (local_path or '', info dict)."""
+    import yt_dlp
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    opts = _ydl_opts(format=fmt, outtmpl=str(_CACHE_DIR / f"{stem}.%(ext)s"),
+                     max_filesize=600 * 1024 * 1024, overwrites=True)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(query, download=True)
+    if info and info.get("entries"):
+        info = info["entries"][0]
+    info = info or {}
+    for d in info.get("requested_downloads") or []:
+        p = d.get("filepath")
+        if p and Path(p).exists():
+            return p, info
+    return "", info
+
+
+def _download_youtube(source: str) -> tuple[str, str, str, str]:
+    """(video_file, audio_file, title, error) — the fallback for when Qt cannot
+    stream the raw URLs. Streaming googlevideo URLs without the headers a browser
+    sends is sometimes refused; a downloaded file always plays.
+
+    Picture and sound are fetched as separate files and played together, which
+    needs no ffmpeg. If the site offers only one combined stream, that single
+    file is used instead."""
+    try:
+        import yt_dlp  # noqa: F401
+    except Exception:
+        return "", "", "", "yt-dlp is not installed. Run: pip install yt-dlp"
+    _prune_cache()
+    query = source if _YT.search(source) else f"ytsearch1:{source}"
+    stem = str(int(time.time()))
+    try:
+        v_path, info = _download(
+            query, "bv[height<=720][ext=mp4]/bv[height<=720]/bv", stem + "_v")
+        title = info.get("title") or ""
+        page = info.get("webpage_url") or query
+        if v_path:
+            a_path, _ = _download(page, "ba[ext=m4a]/ba", stem + "_a")
+            if a_path:
+                return v_path, a_path, title, ""
+        s_path, info2 = _download(page, "b[height<=720]/b", stem + "_s")
+        if s_path:
+            return s_path, "", info2.get("title") or title, ""
+        return "", "", "", ("nothing could be downloaded (too large, or no "
+                            "usable format)")
+    except Exception as e:                                  # noqa: BLE001
+        return "", "", "", f"the download failed: {e}"
+
+
 def _search_page(query: str) -> str:
     from urllib.parse import quote_plus
     return f"https://www.youtube.com/results?search_query={quote_plus(query)}"
@@ -227,6 +333,51 @@ def video_player(parameters: dict = None, response=None, player=None,
     return f"status=opening source={source}"
 
 
+def _show(player, url: str, title: str, audio_url: str, fallback) -> None:
+    """Put a video on the display. `fallback` is run by the UI if the stream
+    cannot be played; players that predate that argument are still supported."""
+    if fallback is not None:
+        try:
+            player.show_video(url, title, muted=True, audio_source=audio_url,
+                              fallback=fallback)
+            return
+        except TypeError:
+            pass
+    player.show_video(url, title, muted=True, audio_source=audio_url)
+
+
+def _open_in_browser(player, source: str, err: str) -> None:
+    """Last resort — worse than the HUD, better than silence, and the reason is
+    reported rather than swallowed."""
+    page = source if _YT.search(source) else _search_page(source)
+    opened = ""
+    try:
+        webbrowser.open(page)
+        opened = " and it has been opened in the browser instead"
+    except Exception:
+        pass
+    _say(player, "Tell the user, in one short sentence in their own language: "
+                 f"'{source}' could not be played on the display "
+                 f"({err}){opened}.")
+
+
+def _play_downloaded(player, source: str, token: int) -> None:
+    """Fallback path, run on a worker thread when streaming failed: download the
+    video and play the local file inside the HUD."""
+    if not _still_wanted(token):
+        return
+    v_file, a_file, title, err = _download_youtube(source)
+    if not _still_wanted(token):
+        return
+    if v_file:
+        try:
+            _show(player, v_file, title or source, a_file, None)
+            return
+        except Exception as e:                              # noqa: BLE001
+            err = str(e)
+    _open_in_browser(player, source, err)
+
+
 def _play_youtube(player, source: str, token: int) -> None:
     """The part that takes seconds. Speaks only if something goes wrong —
     silence means the video is on screen, which the user can see for
@@ -242,25 +393,26 @@ def _play_youtube(player, source: str, token: int) -> None:
 
     if url:
         try:
-            player.show_video(url, title or source, muted=True,
-                              audio_source=audio_url)
+            _show(player, url, title or source, audio_url,
+                  lambda: _play_downloaded(player, source, token))
             return
         except Exception as e:                              # noqa: BLE001
             err = str(e)
 
-    # Resolution failed. Opening it in a browser is worse than playing it in the
-    # HUD, but it is a great deal better than doing nothing, and the reason is
-    # reported rather than swallowed.
-    page = source if _YT.search(source) else _search_page(source)
-    opened = ""
-    try:
-        webbrowser.open(page)
-        opened = " and it has been opened in the browser instead"
-    except Exception:
-        pass
-    _say(player, "Tell the user, in one short sentence in their own language: "
-                 f"'{source}' could not be played on the display "
-                 f"({err}){opened}.")
+    # Could not even resolve a stream: try downloading before giving up on the
+    # HUD — extraction and download fail differently (a stream URL can be
+    # refused while the download works).
+    if _still_wanted(token) and "not installed" not in err:
+        v_file, a_file, dl_title, dl_err = _download_youtube(source)
+        if _still_wanted(token) and v_file:
+            try:
+                _show(player, v_file, dl_title or source, a_file, None)
+                return
+            except Exception as e:                          # noqa: BLE001
+                dl_err = str(e)
+        err = f"{err}; {dl_err}" if dl_err else err
+    if _still_wanted(token):
+        _open_in_browser(player, source, err)
 
 
 def _say(player, instruction: str) -> None:
@@ -275,10 +427,11 @@ def _say(player, instruction: str) -> None:
 TOOL = {
     "name": "video_player",
     "description": (
-        "If user wants to open a video on YouTube, he will tell you that specifically"
-        "If user wants to play a video, then he wants to call this feature"
-        "Plays a VIDEO on the assistant's own display, where the avatar "
-        "normally is — and stops it, mutes it or unmutes it. Use whenever the "
+        "Plays a VIDEO on the assistant's own display (the HUD, where the "
+        "avatar normally is) — and stops it, mutes it or unmutes it. This is "
+        "THE tool for any request to play, watch or put on a video, including "
+        "YouTube videos and trailers; it plays inside the app, not in a "
+        "browser. Use whenever the "
         "user wants to WATCH something on screen: 'play the new Dune trailer', "
         "'şu videoyu oynat', 'play C:/clips/holiday.mp4', 'put that YouTube "
         "video on the screen', 'stop the video', 'videoyu kapat', 'turn the "
@@ -289,9 +442,9 @@ TOOL = {
         "This returns the moment it is asked, before the picture appears: when "
         "it answers 'status=opening', say in one short sentence that you are "
         "putting it on the display, and do not wait or call it again. "
-        "Do NOT use 'youtube_video' for this: that optional plugin opens videos "
-        "in the web browser and summarises transcripts, it never plays anything "
-        "on the assistant's display."
+        "Do NOT use 'youtube_video' to play things: it is for transcript "
+        "summaries, video info and trending lists. Only open a video in the "
+        "web browser if the user explicitly says 'in the browser'."
     ),
     "parameters": {
         "type": "OBJECT",

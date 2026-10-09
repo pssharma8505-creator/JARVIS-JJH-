@@ -146,6 +146,11 @@ def _pcm_level(samples) -> float:
 # is trusted again: covers room decay and the speaker's own settling.
 _TAIL_MARGIN = 0.25
 
+# If JARVIS is flagged as speaking but no audio has been written for this long and
+# nothing is queued, the end-of-turn signal was lost (interrupted turn, dropped
+# packet). Without this the mic stays closed for good — "the mic stopped working".
+_SPEAK_STUCK_S = 5.0
+
 _VIS_WIN = 1024        # ~43 ms analysis window at 24 kHz: enough for formants
 _VIS_HOP = 480         # 20 ms between frames, i.e. 50 shapes a second
 
@@ -581,6 +586,8 @@ class JarvisLive:
         self.ui.on_interrupt      = self.interrupt
         self.ui.on_voice_change   = self._on_voice_change     # voice picker → rebuild session
         self.ui.on_audio_device_change = self._on_audio_device_change
+        self.ui.on_audio_hotplug       = self._on_audio_hotplug
+        self.ui.on_audio_rescan        = self._on_audio_rescan
         self._reconnect_event: asyncio.Event | None = None
         self._reconnect_keep = True   # False → next rebuild drops the resumption handle
 
@@ -808,6 +815,22 @@ class JarvisLive:
         but the conversation is kept, which is the whole reason resumption
         landed before this feature did."""
         self.request_reconnect(keep_context=True, reason="audio device")
+
+    def _on_audio_hotplug(self):
+        """Qt saw an audio endpoint appear or vanish (Bluetooth connected, USB
+        unplugged, default device moved). PortAudio will not notice by itself,
+        so flag a re-scan and rebuild the session — conversation kept. Waits for
+        JARVIS to finish a sentence rather than cutting it off."""
+        audio_devices.mark_dirty()
+        if self._is_speaking:
+            threading.Timer(2.0, self._on_audio_hotplug).start()
+            return
+        self.request_reconnect(keep_context=True, reason="audio devices changed")
+
+    def _on_audio_rescan(self):
+        """'Rescan' pressed in the device picker."""
+        audio_devices.mark_dirty()
+        self.request_reconnect(keep_context=True, reason="audio rescan")
 
     async def _watch_reconnect(self):
         """Session-scoped task: when a voluntary reconnect is requested, raise a
@@ -1310,7 +1333,18 @@ class JarvisLive:
         print("[JARVIS] 🎤 Mic started")
         loop = asyncio.get_event_loop()
 
+        # What the device really opens at. Bluetooth headsets and WASAPI
+        # endpoints often refuse 16 kHz mono, so the stream runs at the
+        # device's own format and the callback converts to what Gemini wants.
+        _mic_fmt = {"rate": SEND_SAMPLE_RATE, "ch": CHANNELS}
+
         def callback(indata, frames, time_info, status):
+            if _mic_fmt["rate"] != SEND_SAMPLE_RATE or _mic_fmt["ch"] != 1:
+                try:
+                    indata = audio_devices.to_mono_16k(
+                        indata, _mic_fmt["rate"], SEND_SAMPLE_RATE)
+                except Exception:
+                    return
             # ── Wake-word gate ───────────────────────────────────────────────
             # While asleep, the mic audio NEVER goes to Gemini (nothing is
             # streamed, so JARVIS can't respond to speech not addressed to it and
@@ -1386,11 +1420,17 @@ class JarvisLive:
 
         try:
             def _open_mic(dev):
+                rate, ch = audio_devices.open_params(dev, "input")
+                _mic_fmt["rate"], _mic_fmt["ch"] = rate, ch
+                if (rate, ch) != (SEND_SAMPLE_RATE, CHANNELS):
+                    print(f"[JARVIS] 🎤 Device opens at {rate} Hz / {ch} ch — "
+                          f"converting to {SEND_SAMPLE_RATE} Hz mono")
                 return sd.InputStream(
-                    samplerate=SEND_SAMPLE_RATE,
-                    channels=CHANNELS,
+                    samplerate=rate,
+                    channels=ch,
                     dtype="int16",
-                    blocksize=CHUNK_SIZE,
+                    # Same ~64 ms of audio per callback whatever the rate.
+                    blocksize=max(1, int(CHUNK_SIZE * rate / SEND_SAMPLE_RATE)),
                     device=dev,
                     callback=callback,
                 )
@@ -1421,7 +1461,15 @@ class JarvisLive:
             with _mic_stream:
                 print("[JARVIS] 🎤 Mic stream open")
                 while True:
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.5)
+                    # A headset that disconnects, or a USB mic pulled out, does
+                    # not raise anywhere — the stream just stops delivering.
+                    # Notice, and rebuild the session so devices are re-scanned.
+                    if not _mic_stream.active:
+                        audio_devices.mark_dirty()
+                        raise RuntimeError(
+                            "microphone stream stopped (device removed or "
+                            "switched?) — reconnecting to re-scan audio devices")
         except Exception as e:
             print(f"[JARVIS] ❌ Mic: {e}")
             raise
@@ -1601,21 +1649,38 @@ class JarvisLive:
     async def _play_audio(self):
         print("[JARVIS] 🔊 Play started")
 
-        _spk_name = get_output_device()
+        # If the microphone is a Bluetooth headset's, the speaker has to be that
+        # headset's Hands-Free endpoint too — the stereo one disappears the
+        # moment the mic opens. (This run only; the saved choice is untouched.)
+        _spk_name = audio_devices.reconcile_bluetooth(
+            get_input_device(), get_output_device())
         _spk_dev  = audio_devices.resolve(_spk_name, "output")
         if _spk_dev is not None:
             print(f"[JARVIS] 🔊 Output device: {_spk_name}")
 
+        # What the device really opens at; the model's 24 kHz mono is converted
+        # on the way out (see audio_devices.from_mono).
+        _spk_fmt = {"rate": RECEIVE_SAMPLE_RATE, "ch": CHANNELS}
+
         def _open_spk(dev):
+            rate, ch = audio_devices.open_params(dev, "output")
+            _spk_fmt["rate"], _spk_fmt["ch"] = rate, ch
+            if (rate, ch) != (RECEIVE_SAMPLE_RATE, CHANNELS):
+                print(f"[JARVIS] 🔊 Device opens at {rate} Hz / {ch} ch — "
+                      f"converting from {RECEIVE_SAMPLE_RATE} Hz mono")
             st = sd.RawOutputStream(
-                samplerate=RECEIVE_SAMPLE_RATE,
-                channels=CHANNELS,
+                samplerate=rate,
+                channels=ch,
                 dtype="int16",
-                blocksize=CHUNK_SIZE,
+                blocksize=max(1, int(CHUNK_SIZE * rate / RECEIVE_SAMPLE_RATE)),
                 device=dev,
             )
             st.start()
             return st
+
+        def _write_pcm(raw: bytes):
+            stream.write(audio_devices.from_mono(
+                raw, RECEIVE_SAMPLE_RATE, _spk_fmt["rate"], _spk_fmt["ch"]))
 
         try:
             stream = _open_spk(_spk_dev)
@@ -1642,6 +1707,7 @@ class JarvisLive:
         except Exception:
             pass
 
+        _last_write = time.monotonic()
         try:
             while True:
                 try:
@@ -1657,6 +1723,14 @@ class JarvisLive:
                     ):
                         self.set_speaking(False)
                         self._turn_done_event.clear()
+                    elif (
+                        self._is_speaking
+                        and self.audio_in_queue.empty()
+                        and time.monotonic() - _last_write > _SPEAK_STUCK_S
+                    ):
+                        # The turn-complete signal never came. Re-open the mic.
+                        print("[JARVIS] 🎤 Speaking flag stuck — releasing the mic")
+                        self.set_speaking(False)
                     continue
 
                 self.set_speaking(True)
@@ -1722,7 +1796,8 @@ class JarvisLive:
                     pass
 
                 try:
-                    await asyncio.to_thread(stream.write, bytes(batch))
+                    await asyncio.to_thread(_write_pcm, bytes(batch))
+                    _last_write = time.monotonic()
                 except (RuntimeError, asyncio.CancelledError):
                     break   # executor shutting down — exit cleanly
         except Exception as e:
@@ -2093,6 +2168,12 @@ class JarvisLive:
 
         while True:
             try:
+                # All audio streams from the previous session are closed by now,
+                # which is the only moment PortAudio can be restarted to see
+                # devices that appeared (Bluetooth!) or vanished since launch.
+                if audio_devices.consume_dirty():
+                    await asyncio.to_thread(audio_devices.reinit)
+
                 print("[JARVIS] Connecting...")
                 self.ui.set_state("THINKING")
                 # Pick the rung to open the conversation on. A model resting

@@ -25,6 +25,7 @@ WHY THIS IS CACHED
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 
@@ -36,6 +37,19 @@ DEFAULT_VALUE = ""
 
 _cache: dict[str, list[str]] | None = None
 _cache_lock = threading.Lock()
+
+# PortAudio is not re-entrant for enumeration/probing, and reinit() tears the
+# whole library down — everything that touches `sd` for discovery takes this.
+_pa_lock = threading.RLock()
+
+# Bumped every time the device list is rebuilt, so the UI can tell "my list is
+# stale" from "nothing happened yet" without polling the OS itself.
+_generation = 0
+
+# Set when something happened that PortAudio cannot know about on its own
+# (a Bluetooth headset connected, a USB mic was unplugged). The run loop calls
+# consume_dirty() before it opens streams and, if set, re-enumerates first.
+_dirty = False
 
 # Which host API each direction settled on, so resolve() opens the same endpoint
 # the picker listed. Filled in by _query().
@@ -116,20 +130,161 @@ _PROBE_SECONDS = {"output": 0.6, "input": 0.35}
 _probe_results: dict = {}
 
 
-def _transport_works(idx: int, kind: str, api_key) -> bool:
-    """Does this host API actually move audio, or only pretend to?
+# ── Which format will this device really open at? ────────────────────────────
+#
+# main.py streams the microphone at 16 kHz and plays the model at 24 kHz, and the
+# first versions of this module treated a device that would not open at exactly
+# those numbers as "not usable". That is the wrong rule for Bluetooth. A headset
+# in hands-free (HFP) mode runs at 8 or 16 kHz, a stereo (A2DP) sink at 44.1 or
+# 48 kHz, WASAPI will not resample, and some endpoints only accept two channels.
+# Such devices were silently dropped from the picker — or, if saved, silently
+# swapped for the system default — which is the "earbuds never work" bug.
+#
+# So instead of asking "does it open at OUR format?", find a format it DOES open
+# at and let the app convert (to_mono_16k / from_mono, below).
+_EXTRA_RATES = (48000, 44100, 16000, 8000, 32000, 24000, 22050)
 
-    Probed once per API per direction and cached. Output writes silence, so the
-    probe is inaudible; input reads and discards."""
-    if api_key in _probe_results:
-        return _probe_results[api_key]
+# {(device_index, kind): (rate, channels) | None}. Cleared by reinit()/configure().
+_params_cache: dict = {}
 
-    ok = False
+
+def _try_open(idx: int, kind: str, rate: int, ch: int) -> bool:
+    """Open a real stream at this format and close it again."""
+    st = None
     try:
         import sounddevice as sd
-        rate = _RATES.get(kind, 16000)
-        secs = _PROBE_SECONDS.get(kind, 0.5)
+        if kind == "input":
+            st = sd.InputStream(samplerate=rate, channels=ch, dtype="int16",
+                                blocksize=1024, device=idx,
+                                callback=lambda *_a: None)
+        else:
+            st = sd.RawOutputStream(samplerate=rate, channels=ch, dtype="int16",
+                                    blocksize=1024, device=idx)
+        st.start()
+        return True
+    except Exception:
+        return False
+    finally:
+        if st is not None:
+            try:
+                st.stop(); st.close()
+            except Exception:
+                pass
 
+
+def _probe_params(idx: int, kind: str):
+    """(rate, channels) this device opens at, preferring the app's own rate and
+    mono, or None if it opens at nothing. Cached per device."""
+    key = (idx, kind)
+    with _pa_lock:
+        if key in _params_cache:
+            return _params_cache[key]
+
+        rates = [_RATES.get(kind, 16000)]
+        max_ch = 2
+        try:
+            import sounddevice as sd
+            info = sd.query_devices(idx)
+            native = int(round(info.get("default_samplerate") or 0))
+            if native:
+                rates.append(native)
+            chan_key = "max_input_channels" if kind == "input" else "max_output_channels"
+            max_ch = int(info.get(chan_key, 2) or 2)
+        except Exception:
+            pass
+        rates += list(_EXTRA_RATES)
+        rates = list(dict.fromkeys(r for r in rates if r > 0))
+
+        result = None
+        for ch in (1, 2):
+            if ch > max(max_ch, 1):
+                continue
+            for rate in rates:
+                if _try_open(idx, kind, rate, ch):
+                    result = (rate, ch)
+                    break
+            if result:
+                break
+        _params_cache[key] = result
+        return result
+
+
+def open_params(dev, kind: str) -> tuple[int, int]:
+    """(rate, channels) to open `dev` with — `dev` being what resolve() returned,
+    so None means the system default. Never raises; if nothing can be probed it
+    returns the app's own format and lets the real open report the real error."""
+    fallback = (_RATES.get(kind, 16000), 1)
+    try:
+        import sounddevice as sd
+        idx = dev
+        if idx is None:
+            try:
+                idx = sd.default.device[0 if kind == "input" else 1]
+            except Exception:
+                idx = None
+            if idx is None or idx < 0:
+                try:
+                    idx = sd.query_devices(kind=kind).get("index")
+                except Exception:
+                    idx = None
+        if idx is None or idx < 0:
+            return fallback
+        return _probe_params(int(idx), kind) or fallback
+    except Exception:
+        return fallback
+
+
+def to_mono_16k(block, src_rate: int, dst_rate: int):
+    """Microphone block (n, channels) int16 at src_rate -> (m, 1) int16 at dst_rate."""
+    import numpy as np
+    a = np.asarray(block)
+    a = a.mean(axis=1) if (a.ndim == 2 and a.shape[1] > 1) else a.reshape(-1)
+    a = a.astype(np.float32)
+    if src_rate != dst_rate and a.size:
+        n_out = int(round(a.size * dst_rate / src_rate))
+        if n_out <= 0:
+            return np.zeros((0, 1), dtype=np.int16)
+        if src_rate > dst_rate:
+            k = int(round(src_rate / dst_rate))
+            if k > 1:   # crude low-pass so the decimation does not alias
+                a = np.convolve(a, np.ones(k, dtype=np.float32) / k, mode="same")
+        a = np.interp(np.linspace(0, a.size - 1, n_out), np.arange(a.size), a)
+    return np.clip(a, -32768, 32767).astype(np.int16).reshape(-1, 1)
+
+
+def from_mono(raw: bytes, src_rate: int, dst_rate: int, channels: int) -> bytes:
+    """Mono int16 PCM bytes at src_rate -> PCM bytes at dst_rate with `channels`."""
+    if src_rate == dst_rate and channels == 1:
+        return raw
+    import numpy as np
+    a = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+    if src_rate != dst_rate and a.size:
+        n_out = int(round(a.size * dst_rate / src_rate))
+        if n_out <= 0:
+            return b""
+        if src_rate > dst_rate:
+            k = int(round(src_rate / dst_rate))
+            if k > 1:
+                a = np.convolve(a, np.ones(k, dtype=np.float32) / k, mode="same")
+        a = np.interp(np.linspace(0, a.size - 1, n_out), np.arange(a.size), a)
+    a = np.clip(a, -32768, 32767).astype(np.int16)
+    if channels > 1:
+        a = np.repeat(a[:, None], channels, axis=1)
+    return a.tobytes()
+
+
+def _transport_works(idx: int, kind: str) -> bool:
+    """Does this ONE device actually move audio, or only pretend to?
+
+    Opened at whatever format _probe_params() found for it. Output writes
+    silence, so the probe is inaudible; input reads and discards."""
+    params = _probe_params(idx, kind)
+    if params is None:
+        return False
+    rate, ch = params
+    secs = _PROBE_SECONDS.get(kind, 0.5)
+    try:
+        import sounddevice as sd
         # Each direction is probed the way main.py actually uses it. That is not
         # a detail: DirectSound input passes a callback stream and fails a
         # blocking read, so probing the wrong mode rejected a microphone that
@@ -137,38 +292,45 @@ def _transport_works(idx: int, kind: str, api_key) -> bool:
         if kind == "output":
             # main.py writes with stream.write() — a real sink is rate-limited
             # by the hardware clock, a fake one swallows the buffer instantly.
-            st = sd.RawOutputStream(samplerate=rate, channels=1, dtype="int16",
+            st = sd.RawOutputStream(samplerate=rate, channels=ch, dtype="int16",
                                     blocksize=1024, device=idx)
             st.start()
             t0 = time.monotonic()
-            st.write(bytes(int(rate * secs) * 2))   # silence — inaudible
+            st.write(bytes(int(rate * secs) * 2 * ch))   # silence — inaudible
             elapsed = time.monotonic() - t0
             st.stop(); st.close()
-            ok = elapsed > secs * 0.5
-            if not ok:
-                print(f"[Audio] output: host API reports success but moves no "
-                      f"audio ({elapsed*1000:.0f} ms for {secs*1000:.0f} ms) "
-                      f"— skipping it")
-        else:
-            # main.py reads through a callback — count what arrives.
-            frames = [0]
+            return elapsed > secs * 0.5
+        # main.py reads through a callback — count what arrives.
+        frames = [0]
 
-            def _cb(indata, n, *_a):
-                frames[0] += n
+        def _cb(indata, n, *_a):
+            frames[0] += n
 
-            st = sd.InputStream(samplerate=rate, channels=1, dtype="int16",
-                                blocksize=1024, device=idx, callback=_cb)
-            st.start()
-            time.sleep(secs)
-            st.stop(); st.close()
-            ok = frames[0] > rate * secs * 0.3
-            if not ok:
-                print(f"[Audio] input: host API delivered {frames[0]} frames in "
-                      f"{secs*1000:.0f} ms — skipping it")
+        st = sd.InputStream(samplerate=rate, channels=ch, dtype="int16",
+                            blocksize=1024, device=idx, callback=_cb)
+        st.start()
+        time.sleep(secs)
+        st.stop(); st.close()
+        return frames[0] > rate * secs * 0.3
     except Exception as e:
-        print(f"[Audio] {kind} transport probe failed: {e}")
-        ok = False
+        print(f"[Audio] {kind} transport probe failed on device {idx}: {e}")
+        return False
 
+
+def _api_moves_audio(found, kind: str, api_key) -> bool:
+    """Does this host API move audio at all? Judged on up to three of its
+    devices — NOT just the first. A disconnected or asleep Bluetooth endpoint
+    listed first used to condemn an API whose other devices were fine."""
+    if api_key in _probe_results:
+        return _probe_results[api_key]
+    ok = False
+    for idx, _name in found[:3]:
+        if _transport_works(idx, kind):
+            ok = True
+            break
+    if not ok:
+        print(f"[Audio] {kind}: host API {api_key[0] or 'any'} moves no audio "
+              f"on its first {min(len(found), 3)} device(s) — skipping it")
     _probe_results[api_key] = ok
     return ok
 
@@ -203,39 +365,22 @@ def configure(input_rate: int, output_rate: int) -> None:
     global _cache
     _RATES["input"]  = int(input_rate)
     _RATES["output"] = int(output_rate)
+    _params_cache.clear()
+    _probe_results.clear()
     with _cache_lock:
         _cache = None
 
 
 def _usable(idx: int, kind: str) -> bool:
-    """Can this device actually be opened at the rate we need?
+    """Can this device be opened in SOME format we can convert from/to?
 
     Deliberately opens a real stream rather than asking
     `check_output_settings`, because that function lies: it passed for an MME
     endpoint that then failed to open with "The specified format is not
     supported or cannot be translated" [MME error 32]. Opening and immediately
     closing costs milliseconds and is the only answer that holds."""
-    st = None
-    try:
-        import sounddevice as sd
-        rate = _RATES.get(kind, 16000)
-        if kind == "input":
-            st = sd.InputStream(samplerate=rate, channels=1, dtype="int16",
-                                blocksize=1024, device=idx,
-                                callback=lambda *_a: None)
-        else:
-            st = sd.RawOutputStream(samplerate=rate, channels=1, dtype="int16",
-                                    blocksize=1024, device=idx)
-        st.start()
-        return True
-    except Exception:
-        return False
-    finally:
-        if st is not None:
-            try:
-                st.stop(); st.close()
-            except Exception:
-                pass
+    return _probe_params(idx, kind) is not None
+
 
 # Aliases for "the default device" and internal routing endpoints. Matched
 # case-insensitively as substrings against the device name.
@@ -260,6 +405,7 @@ def _query() -> dict[str, list[str]]:
 
     Only real, selectable devices — see the note above."""
     out: dict[str, list[str]] = {"input": [], "output": []}
+    _pa_lock.acquire()
     try:
         import platform
         import sounddevice as sd
@@ -302,8 +448,8 @@ def _query() -> dict[str, list[str]]:
                 found = _collect(api_filter, kind)
                 if not found:
                     continue
-                # One probe per API per direction, cached, on this thread.
-                if not _transport_works(found[0][0], kind, (api_filter, kind)):
+                # One verdict per API per direction, cached, on this thread.
+                if not _api_moves_audio(found, kind, (api_filter, kind)):
                     continue
                 _chosen_api[kind] = api_filter
                 out[kind] = [_display_name(n, devices) for _i, n in found]
@@ -316,6 +462,8 @@ def _query() -> dict[str, list[str]]:
 
     except Exception as e:
         print(f"[Audio] Device enumeration failed: {e}")
+    finally:
+        _pa_lock.release()
     return out
 
 
@@ -323,10 +471,11 @@ def prefetch() -> None:
     """Warm the cache on a background thread. Called once at startup so the
     settings drawer never pays for enumeration on the Qt thread."""
     def _work():
-        global _cache
+        global _cache, _generation
         result = _query()
         with _cache_lock:
             _cache = result
+            _generation += 1
         print(f"[Audio] {len(result['input'])} input / "
               f"{len(result['output'])} output devices found")
     threading.Thread(target=_work, daemon=True, name="audio-devices").start()
@@ -343,6 +492,123 @@ def list_devices(kind: str, refresh: bool = False) -> list[str]:
         with _cache_lock:
             _cache = cached
     return list(cached.get(kind, []))
+
+
+def generation() -> int:
+    """Increments each time the device list is rebuilt."""
+    return _generation
+
+
+def mark_dirty() -> None:
+    """Something changed that PortAudio cannot see by itself (hotplug, Bluetooth
+    connect). The next consume_dirty() returns True exactly once."""
+    global _dirty
+    _dirty = True
+
+
+def consume_dirty() -> bool:
+    global _dirty
+    was, _dirty = _dirty, False
+    return was
+
+
+def reinit() -> None:
+    """Re-enumerate the operating system's audio devices from scratch.
+
+    PortAudio snapshots the device list when it is initialised and never looks
+    again — a Bluetooth headset connected after launch is invisible to it until
+    the library is torn down and brought back up. That is only legal while NO
+    stream is open, so the run loop calls this between sessions, after the old
+    streams are closed and before the new ones open. Never raises."""
+    global _cache, _generation
+    with _pa_lock:
+        try:
+            import sounddevice as sd
+            sd._terminate()
+            sd._initialize()
+        except Exception as e:
+            print(f"[Audio] PortAudio re-initialise failed: {e}")
+        _params_cache.clear()
+        _probe_results.clear()
+        _chosen_api["input"] = _chosen_api["output"] = None
+        result = _query()
+        with _cache_lock:
+            _cache = result
+            _generation += 1
+        print(f"[Audio] Re-scanned: {len(result['input'])} input / "
+              f"{len(result['output'])} output devices")
+
+
+# ── Bluetooth: one headset, two endpoints ────────────────────────────────────
+#
+# Windows exposes a Bluetooth headset as TWO playback devices:
+#     "Headphones (X Stereo)"            A2DP — high quality, NO microphone
+#     "Headset (X Hands-Free AG Audio)"  HFP  — 8/16 kHz, has the microphone
+# and one capture device: "Headset (X Hands-Free AG Audio)". The instant a
+# program opens that microphone the headset switches profile, the stereo
+# endpoint goes away, and audio sent to it is lost. Using the earbuds' mic with
+# the earbuds' *stereo* output therefore cannot work — both directions have to
+# sit on the Hands-Free pair.
+_BT_RE = re.compile(r"\((.+?)\s+(hands-free(?:\s+ag\s+audio)?|ag\s+audio|stereo)\)\s*$",
+                    re.IGNORECASE)
+
+
+def _bt_parts(name: str):
+    """(device_base_name_lowercase, is_hands_free) or None if not a BT endpoint."""
+    m = _BT_RE.search(name or "")
+    if not m:
+        return None
+    kind = m.group(2).lower()
+    return m.group(1).strip().lower(), ("hands-free" in kind or "ag" in kind)
+
+
+def _default_name(kind: str) -> str:
+    try:
+        import sounddevice as sd
+        name = (sd.query_devices(kind=kind).get("name") or "").strip()
+    except Exception:
+        return ""
+    # MME truncates to 31 characters; expand it from the picker's list.
+    for n in list_devices(kind):
+        if name and n.startswith(name[:24]):
+            return n
+    return name
+
+
+def reconcile_bluetooth(in_name: str, out_name: str) -> str:
+    """Return the speaker name to use, moving it onto the matching Hands-Free
+    endpoint when the microphone is a Bluetooth headset's. Used for this run
+    only — the saved setting is left alone."""
+    try:
+        in_eff = (in_name or "").strip()
+        if not in_eff or in_eff == DEFAULT_LABEL:
+            in_eff = _default_name("input")
+        mic = _bt_parts(in_eff)
+        if not mic or not mic[1]:
+            return out_name
+        base = mic[0]
+        hands_free = [n for n in list_devices("output")
+                      if (p := _bt_parts(n)) and p[0] == base and p[1]]
+        if not hands_free:
+            return out_name
+
+        out_eff = (out_name or "").strip()
+        if not out_eff or out_eff == DEFAULT_LABEL:
+            # "System default" only needs moving if the default IS this headset.
+            if base[:18] in _default_name("output").lower():
+                print(f"[Audio] Bluetooth mic in use — routing speaker to "
+                      f"'{hands_free[0]}' (the stereo endpoint drops out when the "
+                      f"mic opens)")
+                return hands_free[0]
+            return out_name
+        cur = _bt_parts(out_eff)
+        if cur and cur[0] == base and not cur[1]:
+            print(f"[Audio] Bluetooth mic in use — routing speaker to "
+                  f"'{hands_free[0]}' instead of the stereo endpoint")
+            return hands_free[0]
+    except Exception as e:
+        print(f"[Audio] Bluetooth routing check failed: {e}")
+    return out_name
 
 
 def resolve(name: str, kind: str):
@@ -413,8 +679,8 @@ def resolve(name: str, kind: str):
             if partial is not None:
                 return partial
 
-        print(f"[Audio] Saved {kind} device '{wanted}' cannot be opened at "
-              f"{_RATES.get(kind)} Hz on any host API — using system default")
+        print(f"[Audio] Saved {kind} device '{wanted}' cannot be opened in any "
+              f"format on any host API — using system default")
         return None
     except Exception as e:
         print(f"[Audio] resolve({kind}) failed: {e} — using system default")

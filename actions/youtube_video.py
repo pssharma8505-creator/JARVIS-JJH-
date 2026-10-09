@@ -282,9 +282,20 @@ def _scrape_trending(region: str = "TR", max_results: int = 8) -> list[dict]:
         return []
 
 def _handle_play(parameters: dict, player) -> str:
-    query = parameters.get("query", "").strip()
+    query = (parameters.get("query") or parameters.get("url") or "").strip()
     if not query:
         return "Please tell me what you'd like to watch, sir."
+
+    # Playing belongs on the assistant's own display. The browser is only used
+    # when the caller asks for it explicitly, or when there is no HUD to play on.
+    if player is not None and hasattr(player, "show_video") \
+            and not parameters.get("in_browser"):
+        try:
+            from actions.video_player import video_player
+            return video_player({"action": "play", "source": query},
+                                player=player)
+        except Exception as e:
+            print(f"[YouTube] HUD player unavailable ({e}) — using the browser")
 
     if player:
         player.write_log(f"[YouTube] Searching: {query}")
@@ -444,7 +455,7 @@ def youtube_video(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "youtube_video",
-    "description": "Controls YouTube. Use for: playing videos, summarizing a video's content, getting video info, or showing trending videos.",
+    "description": "Controls YouTube. Use for: summarizing a video's content, getting video info, or showing trending videos. Its 'play' action plays the video on the assistant's own display; set in_browser=true ONLY if the user explicitly asks to open it in the web browser.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
@@ -466,7 +477,11 @@ TOOL = {
             },
             "url": {
                 "type": "STRING",
-                "description": "Video URL for get_info action"
+                "description": "Video URL for get_info action (or play)"
+            },
+            "in_browser": {
+                "type": "BOOLEAN",
+                "description": "play only: open in the web browser instead of the display"
             }
         },
         "required": []
