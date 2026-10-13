@@ -1,0 +1,13 @@
+[build]
+  publish = "dashboard/static"
+  command = "echo 'JARVIS Web Dashboard build complete'"
+
+[[redirects]]
+  from = "/api/*"
+  to = "/index.html"
+  status = 200
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

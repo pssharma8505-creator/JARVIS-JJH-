@@ -45,16 +45,27 @@ PROMPT_INDEX_CHARS = 420
 PROMPT_MAX_PER_CATEGORY = 6
 
 def _empty_memory() -> dict:
+    today = datetime.now().strftime("%Y-%m-%d")
     return {
-        "identity":      {},
-        "preferences":   {},
-        "projects":      {},
-        "relationships": {},
-        "wishes":        {},
-        "notes":         {},
+        "identity": {
+            "name": {"value": "ANUBHAV", "updated": today},
+            "role": {"value": "JARVIS is my personal assistant, my friend who supports me everywhere and gives suggestions", "updated": today},
+            "system_type": {"value": "Most intelligent AGI assistant and friend", "updated": today},
+        },
+        "preferences": {
+            "music_genres": {"value": "phonk, soft songs, spider man songs, back in black", "updated": today},
+            "music_favorite_song": {"value": "Back in Black", "updated": today},
+        },
+        "projects": {},
+        "relationships": {
+            "assistant_relationship": {"value": "JARVIS is ANUBHAV's supportive friend and intelligent AI companion", "updated": today},
+        },
+        "wishes": {},
+        "notes": {},
     }
 
 def load_memory() -> dict:
+    MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not MEMORY_PATH.exists():
         return _empty_memory()
     with _lock:

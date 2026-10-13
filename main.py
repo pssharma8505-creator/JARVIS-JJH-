@@ -1371,18 +1371,28 @@ class JarvisLive:
                 return
             
             if not self.ui.muted and not self._phone_active:
-                data = indata.tobytes()
-                loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
-                    {"data": data, "mime_type": "audio/pcm"}
-                )
-                # Feed the live mic level to the HUD so the waveform reacts to
-                # the user's actual voice while listening. Purely cosmetic — any
-                # failure here must never disturb the mic.
+                level = _pcm_level(indata)
                 try:
-                    self.ui.set_audio_level(_pcm_level(indata))
+                    self.ui.set_audio_level(level)
                 except Exception:
                     pass
+
+                # Network data optimization:
+                # Skip streaming continuous silent audio buffers during room silence
+                # while maintaining a periodic keep-alive frame for connection health.
+                if level > 0.0:
+                    self._silent_chunks = 0
+                    should_send = True
+                else:
+                    self._silent_chunks = getattr(self, "_silent_chunks", 0) + 1
+                    should_send = (self._silent_chunks % 40 == 0)
+
+                if should_send:
+                    data = indata.tobytes()
+                    loop.call_soon_threadsafe(
+                        self.out_queue.put_nowait,
+                        {"data": data, "mime_type": "audio/pcm"}
+                    )
 
         try:
             def _open_mic(dev):

@@ -153,28 +153,41 @@
   </div>
 
   <script>
-    // Try auto-reconnect with stored device token (set on first QR login)
+    // Direct auto-connect without session key prompt
     (async function() {
       const devTok = localStorage.getItem('jarvis_device_token');
-      if (!devTok) return;
-      document.getElementById('reconnecting').style.display = 'block';
+      if (devTok) {
+        try {
+          const r = await fetch('/api/device-login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ device_token: devTok }),
+          });
+          const d = await r.json();
+          if (d.ok && d.token) {
+            sessionStorage.setItem('jarvis_key', d.key);
+            sessionStorage.setItem('jarvis_token', d.token);
+            location.replace('/');
+            return;
+          }
+        } catch (_) {}
+      }
+
+      // Auto-login directly
       try {
-        const r = await fetch('/api/device-login', {
+        const r = await fetch('/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ device_token: devTok }),
+          body: JSON.stringify({ pin: "AUTO" })
         });
-        const d = await r.json();
-        if (d.ok && d.token) {
-          sessionStorage.setItem('jarvis_key', d.key);
-          sessionStorage.setItem('jarvis_token', d.token);
+        const data = await r.json();
+        if (data.ok && data.token) {
+          sessionStorage.setItem('jarvis_key', data.key || 'JARVIS-AUTO');
+          sessionStorage.setItem('jarvis_token', data.token);
           location.replace('/');
           return;
         }
       } catch (_) {}
-      // Device token rejected (server restarted) — clear it and show normal form
-      localStorage.removeItem('jarvis_device_token');
-      document.getElementById('reconnecting').style.display = 'none';
     })();
 
     const inp = document.getElementById('key');
