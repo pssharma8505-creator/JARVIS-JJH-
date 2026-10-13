@@ -569,22 +569,28 @@ class DashboardServer:
 
         @app.post("/login")
         async def login(req: Request):
-            body    = await req.json()
+            try:
+                body = await req.json()
+            except Exception:
+                body = {}
             entered = str(body.get("pin", "")).strip().upper()
             now     = time.time()
-            if entered in self._pending_keys and self._pending_keys[entered] > now:
-                del self._pending_keys[entered]          # one-time use
+            # Allow key validation OR auto-login if key is empty/AUTO
+            is_valid_key = entered in self._pending_keys and self._pending_keys[entered] > now
+            if is_valid_key or not entered or entered == "AUTO":
+                session_key = entered if is_valid_key else "JARVIS-AUTO"
+                if is_valid_key:
+                    del self._pending_keys[entered]
                 tok = secrets.token_urlsafe(32)
                 self._tokens.add(tok)
-                self._token_keys[tok] = entered
-                self._aes_key(entered)                   # pre-derive & cache
+                self._token_keys[tok] = session_key
+                self._aes_key(session_key)
                 if self._connect_callback:
                     self._connect_callback()
                 asyncio.create_task(self.broadcast(
                     {"type": "sys", "text": "Remote connection established."}
                 ))
-                # Bearer token in response body — no cookies needed (works on any browser/HTTP)
-                return JSONResponse({"ok": True, "token": tok})
+                return JSONResponse({"ok": True, "token": tok, "key": session_key})
             return JSONResponse({"ok": False, "error": "Invalid or expired key"},
                                 status_code=401)
 
