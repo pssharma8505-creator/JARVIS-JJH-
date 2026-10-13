@@ -1068,7 +1068,9 @@ class LogWidget(QTextEdit):
 
     def _step(self):
         if self._pos < len(self._text):
-            ch  = self._text[self._pos]
+            # Batch characters (3 per tick or remaining) for maximum smoothness and low CPU
+            step_size = 3 if len(self._queue) == 0 else 8
+            chunk = self._text[self._pos:self._pos + step_size]
             cur = self.textCursor()
             fmt = cur.charFormat()
             col = {
@@ -1076,19 +1078,14 @@ class LogWidget(QTextEdit):
                 "ai":   qcol(C.PRI),
                 "err":  qcol(C.RED),
                 "file": qcol(C.GREEN),
-                # SYS lines are the bulk of the log. Amber fought the cyan HUD
-                # and, being a fixed status colour rather than a hue-linked one,
-                # stayed amber even after the accent picker retinted everything
-                # else. TEXT_MED follows the theme and drops the contrast to a
-                # level you can read past.
                 "sys":  qcol(C.TEXT_MED),
             }.get(self._tag, qcol(C.TEXT))
             fmt.setForeground(QBrush(col))
             cur.movePosition(cur.MoveOperation.End)
-            cur.insertText(ch, fmt)
+            cur.insertText(chunk, fmt)
             self.setTextCursor(cur)
             self.ensureCursorVisible()
-            self._pos += 1
+            self._pos += len(chunk)
         else:
             self._tmr.stop()
             cur = self.textCursor()
@@ -1096,7 +1093,7 @@ class LogWidget(QTextEdit):
             cur.insertText("\n")
             self.setTextCursor(cur)
             self.ensureCursorVisible()
-            QTimer.singleShot(20, self._next)
+            QTimer.singleShot(15, self._next)
 
 _FILE_ICONS = {
     "image":   ("🖼", "#00d4ff"), "video":   ("🎬", "#ff6b00"),

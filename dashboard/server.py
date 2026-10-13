@@ -535,7 +535,9 @@ class DashboardServer:
 
     # ── FastAPI app ───────────────────────────────────────────────────────
 
-    def _build_app(self) -> "FastAPI":
+    def _build_app(self) -> "FastAPI | None":
+        if not _DEPS_OK:
+            return None
         app = FastAPI(docs_url=None, redoc_url=None)
 
         def _auth(req: Request) -> bool:

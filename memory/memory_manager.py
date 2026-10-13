@@ -55,6 +55,7 @@ def _empty_memory() -> dict:
     }
 
 def load_memory() -> dict:
+    MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not MEMORY_PATH.exists():
         return _empty_memory()
     with _lock:

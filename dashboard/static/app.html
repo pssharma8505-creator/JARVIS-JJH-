@@ -506,14 +506,29 @@
           const nd = new AudioWorkletNode(ctx, 'j');
           // Buffer to 1024 samples (64 ms at 16 kHz) before sending —
           // matches PC mic chunk size, prevents queue flooding on the server.
-          let _pbuf = [], _plen = 0;
+          let _pbuf = [], _plen = 0, _silentCnt = 0;
           nd.port.onmessage = e => {
-            const chunk = new Int16Array(_f32toPcm16(e.data, rate));
+            const rawData = e.data;
+            let sum = 0;
+            for (let k = 0; k < rawData.length; k++) sum += rawData[k] * rawData[k];
+            const rms = Math.sqrt(sum / (rawData.length || 1));
+
+            const chunk = new Int16Array(_f32toPcm16(rawData, rate));
             _pbuf.push(chunk); _plen += chunk.length;
             if (_plen >= 1024) {
               const out = new Int16Array(_plen); let off = 0;
               for (const c of _pbuf) { out.set(c, off); off += c.length; }
-              if (ws.readyState === 1) ws.send(out.buffer);
+
+              // Network data optimization: send audio if audible or periodic keep-alive
+              if (rms > 0.005) {
+                _silentCnt = 0;
+                if (ws.readyState === 1) ws.send(out.buffer);
+              } else {
+                _silentCnt++;
+                if (_silentCnt % 30 === 0 && ws.readyState === 1) {
+                  ws.send(out.buffer);
+                }
+              }
               _pbuf = []; _plen = 0;
             }
           };
